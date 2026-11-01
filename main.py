@@ -1,24 +1,19 @@
 import argparse
 import logging
+import os
+import re
+import sys
 import requests
 import json
-from datetime import datetime, timezone
-from dateutil import parser
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Define API endpoints (replace with actual API keys and URLs)
-# The keys below are the literal placeholder strings, and there is no
-# environment variable or config file path anywhere in this tool. As
-# shipped, both services get a placeholder key, both fetches fail, and
-# main reports that no data could be fetched. Making it work means
-# editing this source file, which is also where a real key would then
-# sit in version control.
-VT_API_URL = "https://www.virustotal.com/api/v3/files/{}/relationships/behaviours"  # Example: VirusTotal file behaviors API
-VT_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"  # Replace with your VirusTotal API key
-OTX_API_URL = "https://otx.alienvault.com/api/v1/indicator/file/{}"  # Example: AlienVault OTX file indicator API
-OTX_API_KEY = "YOUR_OTX_API_KEY" # Replace with your AlienVault OTX API Key
+# Define API endpoints. API keys are read from the environment at run
+# time (VT_API_KEY and OTX_API_KEY) and are never stored in source.
+VT_API_URL = "https://www.virustotal.com/api/v3/files/{}/relationships/behaviours"  # VirusTotal file behaviors API
+OTX_API_URL = "https://otx.alienvault.com/api/v1/indicator/file/{}"  # AlienVault OTX file indicator API
+REQUEST_TIMEOUT = 15
 
 # Error handling decorator
 def handle_errors(func):
@@ -41,13 +36,14 @@ def fetch_virustotal_data(file_hash):
     Returns:
         dict: A dictionary containing the VirusTotal data, or None on error.
     """
-    headers = {"x-apikey": VT_API_KEY}
+    api_key = os.environ.get("VT_API_KEY")
+    if not api_key:
+        logging.warning("Skipping VirusTotal lookup: VT_API_KEY is not set.")
+        return None
+    headers = {"x-apikey": api_key}
     url = VT_API_URL.format(file_hash)
     try:
-        # No timeout on this call, or on the OTX one: a server that
-        # accepts the connection and then goes quiet hangs the run
-        # forever instead of landing in the error handling below.
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -67,10 +63,14 @@ def fetch_otx_data(file_hash):
     Returns:
         dict: A dictionary containing the OTX data, or None on error.
     """
-    headers = {"X-OTX-API-KEY": OTX_API_KEY}
+    api_key = os.environ.get("OTX_API_KEY")
+    if not api_key:
+        logging.warning("Skipping OTX lookup: OTX_API_KEY is not set.")
+        return None
+    headers = {"X-OTX-API-KEY": api_key}
     url = OTX_API_URL.format(file_hash)
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -118,11 +118,7 @@ def correlate_indicators(vt_data, otx_data):
               vt_ips.update(item['attributes']['ip_addresses'])
 
     otx_ips = set()
-    # The guard tests 'pulse_info' at the top level of otx_data, but
-    # the body reads it under 'General'. Unless the response carries
-    # both shapes, the whole block is skipped and OTX contributes no
-    # IPs, so the IP intersection below can only ever be empty.
-    if otx_data and 'General' in otx_data and 'pulse_info' in otx_data and 'related' in otx_data['General']['pulse_info']:
+    if otx_data and 'General' in otx_data and 'pulse_info' in otx_data['General'] and 'related' in otx_data['General']['pulse_info']:
         for pulse in otx_data['General']['pulse_info']['related']:
             if 'indicators' in pulse:
                 for indicator in pulse['indicators']:
@@ -144,40 +140,48 @@ def setup_argparse():
 def main():
     """Main function to execute the threat intelligence correlation."""
     args = setup_argparse()
-    file_hash = args.file_hash
+    file_hash = args.file_hash.strip() if isinstance(args.file_hash, str) else ""
 
-    # Input Validation
-    if not isinstance(file_hash, str) or not file_hash:
-        logging.error("Invalid file hash provided.")
-        return
+    # Input Validation: a file hash is hex of length 32, 40, or 64.
+    if not re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}", file_hash or ""):
+        logging.error("Invalid file hash provided: expected a 32, 40, or 64 character hex hash.")
+        sys.exit(1)
 
     logging.info(f"Analyzing file hash: {file_hash}")
 
-    # Fetch data from VirusTotal and AlienVault OTX
+    # Fetch data from VirusTotal and AlienVault OTX. A source whose key
+    # is not configured is skipped with a stated reason inside its
+    # fetch function, and the run is then reported as partial.
     vt_data = fetch_virustotal_data(file_hash)
     otx_data = fetch_otx_data(file_hash)
 
     if vt_data:
         logging.info("VirusTotal data fetched successfully.")
     else:
-        logging.warning("Failed to fetch VirusTotal data.")
+        logging.warning("No VirusTotal data was retrieved.")
 
     if otx_data:
         logging.info("OTX data fetched successfully.")
     else:
-        logging.warning("Failed to fetch OTX data.")
+        logging.warning("No OTX data was retrieved.")
 
-    # Correlate indicators
-    if vt_data or otx_data:
-        correlated_data = correlate_indicators(vt_data, otx_data)
+    # Correlate indicators. Total fetch failure is not a verdict: it
+    # exits non-zero and prints no correlation result.
+    if not vt_data and not otx_data:
+        print("No data fetched from VirusTotal or OTX. Cannot correlate.", file=sys.stderr)
+        sys.exit(1)
 
-        if correlated_data:
-            print("Correlated Threat Indicators:")
-            print(json.dumps(correlated_data, indent=4))
-        else:
-            print("No correlated indicators found.")
+    if not vt_data or not otx_data:
+        missing = "VirusTotal" if not vt_data else "OTX"
+        logging.warning(f"Partial result: {missing} lookup was not performed or returned no data, so correlation covers one source only.")
+
+    correlated_data = correlate_indicators(vt_data, otx_data)
+
+    if correlated_data:
+        print("Correlated Threat Indicators:")
+        print(json.dumps(correlated_data, indent=4))
     else:
-        print("No data fetched from VirusTotal or OTX.  Cannot correlate.")
+        print("No correlated indicators found.")
 
 if __name__ == "__main__":
     # Example Usage:
