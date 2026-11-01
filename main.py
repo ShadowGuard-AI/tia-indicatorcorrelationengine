@@ -9,6 +9,12 @@ from dateutil import parser
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define API endpoints (replace with actual API keys and URLs)
+# The keys below are the literal placeholder strings, and there is no
+# environment variable or config file path anywhere in this tool. As
+# shipped, both services get a placeholder key, both fetches fail, and
+# main reports that no data could be fetched. Making it work means
+# editing this source file, which is also where a real key would then
+# sit in version control.
 VT_API_URL = "https://www.virustotal.com/api/v3/files/{}/relationships/behaviours"  # Example: VirusTotal file behaviors API
 VT_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"  # Replace with your VirusTotal API key
 OTX_API_URL = "https://otx.alienvault.com/api/v1/indicator/file/{}"  # Example: AlienVault OTX file indicator API
@@ -38,6 +44,9 @@ def fetch_virustotal_data(file_hash):
     headers = {"x-apikey": VT_API_KEY}
     url = VT_API_URL.format(file_hash)
     try:
+        # No timeout on this call, or on the OTX one: a server that
+        # accepts the connection and then goes quiet hangs the run
+        # forever instead of landing in the error handling below.
         response = requests.get(url, headers=headers)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         return response.json()
@@ -109,6 +118,10 @@ def correlate_indicators(vt_data, otx_data):
               vt_ips.update(item['attributes']['ip_addresses'])
 
     otx_ips = set()
+    # The guard tests 'pulse_info' at the top level of otx_data, but
+    # the body reads it under 'General'. Unless the response carries
+    # both shapes, the whole block is skipped and OTX contributes no
+    # IPs, so the IP intersection below can only ever be empty.
     if otx_data and 'General' in otx_data and 'pulse_info' in otx_data and 'related' in otx_data['General']['pulse_info']:
         for pulse in otx_data['General']['pulse_info']['related']:
             if 'indicators' in pulse:
